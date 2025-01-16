@@ -3,13 +3,46 @@ import {IssuesProcessor} from './classes/issues-processor';
 import {isValidDate} from './functions/dates/is-valid-date';
 import {IIssuesProcessorOptions} from './interfaces/issues-processor-options';
 import {Issue} from './classes/issue';
+import {getStateInstance} from './services/state.service';
 
 async function _run(): Promise<void> {
   try {
     const args = _getAndValidateArgs();
 
-    const issueProcessor: IssuesProcessor = new IssuesProcessor(args);
+    const state = getStateInstance(args);
+    await state.restore();
+
+    const issueProcessor: IssuesProcessor = new IssuesProcessor(args, state);
+
+    const rateLimitAtStart = await issueProcessor.getRateLimit();
+    if (rateLimitAtStart) {
+      core.debug(
+        `Github API rate status: limit=${rateLimitAtStart.limit}, used=${rateLimitAtStart.used}, remaining=${rateLimitAtStart.remaining}`
+      );
+    }
+
     await issueProcessor.processIssues();
+
+    const rateLimitAtEnd = await issueProcessor.getRateLimit();
+
+    if (rateLimitAtEnd) {
+      core.debug(
+        `Github API rate status: limit=${rateLimitAtEnd.limit}, used=${rateLimitAtEnd.used}, remaining=${rateLimitAtEnd.remaining}`
+      );
+
+      if (rateLimitAtStart)
+        core.info(
+          `Github API rate used: ${
+            rateLimitAtStart.remaining - rateLimitAtEnd.remaining
+          }`
+        );
+
+      core.info(
+        `Github API rate remaining: ${rateLimitAtEnd.remaining}; reset at: ${rateLimitAtEnd.reset}`
+      );
+    }
+
+    await state.persist();
 
     await processOutput(
       issueProcessor.staleIssues,
@@ -28,11 +61,11 @@ function _getAndValidateArgs(): IIssuesProcessorOptions {
     stalePrMessage: core.getInput('stale-pr-message'),
     closeIssueMessage: core.getInput('close-issue-message'),
     closePrMessage: core.getInput('close-pr-message'),
-    daysBeforeStale: parseInt(
+    daysBeforeStale: parseFloat(
       core.getInput('days-before-stale', {required: true})
     ),
-    daysBeforeIssueStale: parseInt(core.getInput('days-before-issue-stale')),
-    daysBeforePrStale: parseInt(core.getInput('days-before-pr-stale')),
+    daysBeforeIssueStale: parseFloat(core.getInput('days-before-issue-stale')),
+    daysBeforePrStale: parseFloat(core.getInput('days-before-pr-stale')),
     daysBeforeClose: parseInt(
       core.getInput('days-before-close', {required: true})
     ),
@@ -82,6 +115,7 @@ function _getAndValidateArgs(): IIssuesProcessorOptions {
     exemptAllIssueAssignees: _toOptionalBoolean('exempt-all-issue-assignees'),
     exemptAllPrAssignees: _toOptionalBoolean('exempt-all-pr-assignees'),
     enableStatistics: core.getInput('enable-statistics') === 'true',
+    labelsToRemoveWhenStale: core.getInput('labels-to-remove-when-stale'),
     labelsToRemoveWhenUnstale: core.getInput('labels-to-remove-when-unstale'),
     labelsToAddWhenUnstale: core.getInput('labels-to-add-when-unstale'),
     ignoreUpdates: core.getInput('ignore-updates') === 'true',
@@ -92,11 +126,15 @@ function _getAndValidateArgs(): IIssuesProcessorOptions {
     includeOnlyAssigned: core.getInput('include-only-assigned') === 'true'
   };
 
-  for (const numberInput of [
-    'days-before-stale',
-    'days-before-close',
-    'operations-per-run'
-  ]) {
+  for (const numberInput of ['days-before-stale']) {
+    if (isNaN(parseFloat(core.getInput(numberInput)))) {
+      const errorMessage = `Option "${numberInput}" did not parse to a valid float`;
+      core.setFailed(errorMessage);
+      throw new Error(errorMessage);
+    }
+  }
+
+  for (const numberInput of ['days-before-close', 'operations-per-run']) {
     if (isNaN(parseInt(core.getInput(numberInput)))) {
       const errorMessage = `Option "${numberInput}" did not parse to a valid integer`;
       core.setFailed(errorMessage);
